@@ -29,7 +29,9 @@ function loadChatId() {
       const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
       if (cfg.telegramChatId) chatId = cfg.telegramChatId;
     }
-  } catch { /**/ }
+  } catch (error) {
+    log("telegram_warn", `Invalid user-config.json; chatId not loaded: ${error.message}`);
+  }
 }
 
 function saveChatId(id) {
@@ -101,9 +103,37 @@ async function postTelegram(method, body) {
   }
 }
 
+async function postTelegramRaw(method, body) {
+  if (!TOKEN) return null;
+  try {
+    const res = await fetch(`${BASE}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      return null;
+    }
+    return await res.json();
+  } catch (e) {
+    log("telegram_error", `${method} failed: ${e.message}`);
+    return null;
+  }
+}
+
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
   return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+}
+
+export async function sendMessageWithButtons(text, inlineKeyboard) {
+  if (!TOKEN || !chatId) return;
+  return postTelegram("sendMessage", {
+    text: String(text).slice(0, 4096),
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
 }
 
 export async function sendHTML(html) {
@@ -116,6 +146,23 @@ export async function editMessage(text, messageId) {
   return postTelegram("editMessageText", {
     message_id: messageId,
     text: String(text).slice(0, 4096),
+  });
+}
+
+export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
+  if (!TOKEN || !chatId || !messageId) return null;
+  return postTelegram("editMessageText", {
+    message_id: messageId,
+    text: String(text).slice(0, 4096),
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+}
+
+export async function answerCallbackQuery(callbackQueryId, text = "") {
+  if (!TOKEN || !callbackQueryId) return null;
+  return postTelegramRaw("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    ...(text ? { text: String(text).slice(0, 200) } : {}),
   });
 }
 
@@ -309,6 +356,23 @@ async function poll(onMessage) {
       const data = await res.json();
       for (const update of data.result || []) {
         _offset = update.update_id + 1;
+        const callback = update.callback_query;
+        if (callback?.data && callback?.message) {
+          const callbackMsg = {
+            chat: callback.message.chat,
+            from: callback.from,
+            text: callback.data,
+          };
+          if (!isAuthorizedIncomingMessage(callbackMsg)) continue;
+          await onMessage({
+            ...callbackMsg,
+            isCallback: true,
+            callbackQueryId: callback.id,
+            callbackData: callback.data,
+            messageId: callback.message.message_id,
+          });
+          continue;
+        }
         const msg = update.message;
         if (!msg?.text) continue;
         if (!isAuthorizedIncomingMessage(msg)) continue;
@@ -323,10 +387,47 @@ async function poll(onMessage) {
   }
 }
 
+const BOT_COMMANDS = [
+  { command: "help",       description: "Show commands" },
+  { command: "status",     description: "Wallet + positions snapshot" },
+  { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
+  { command: "positions",  description: "List open positions" },
+  { command: "pool",       description: "Detailed info for one open position" },
+  { command: "close",      description: "Close one position by index" },
+  { command: "closeall",   description: "Close all open positions" },
+  { command: "set",        description: "Set note/instruction on position" },
+  { command: "config",     description: "Show important runtime config" },
+  { command: "settings",   description: "Button menu for common config" },
+  { command: "setcfg",     description: "Update persisted config key" },
+  { command: "screen",     description: "Refresh deterministic candidate list" },
+  { command: "candidates", description: "Show latest cached candidates" },
+  { command: "deploy",     description: "Deploy candidate by cached index" },
+  { command: "briefing",   description: "Morning briefing" },
+  { command: "hive",       description: "HiveMind sync status" },
+  { command: "pause",      description: "Stop cron cycles" },
+  { command: "resume",     description: "Start cron cycles again" },
+  { command: "stop",       description: "Shut down agent" },
+];
+
+async function registerCommands() {
+  if (!BASE) return;
+  try {
+    await fetch(`${BASE}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+    log("telegram", "Bot commands registered");
+  } catch (e) {
+    log("telegram_warn", `Failed to register bot commands: ${e.message}`);
+  }
+}
+
 export function startPolling(onMessage) {
   if (!TOKEN) return;
   _polling = true;
   poll(onMessage); // fire-and-forget
+  registerCommands();
   log("telegram", "Bot polling started");
 }
 
@@ -335,10 +436,13 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, binStep, baseFee }) {
+export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
   if (hasActiveLiveMessage()) return;
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
+    : "";
+  const coverageStr = rangeCoverage
+    ? `Range cover: ${fmtPct(rangeCoverage.downside_pct)} downside | ${fmtPct(rangeCoverage.upside_pct)} upside | ${fmtPct(rangeCoverage.width_pct)} total\n`
     : "";
   const poolStr = (binStep || baseFee)
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
@@ -347,6 +451,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     `✅ <b>Deployed</b> ${pair}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
+    coverageStr +
     poolStr +
     `Position: <code>${position?.slice(0, 8)}...</code>\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
@@ -381,4 +486,9 @@ export async function notifyOutOfRange({ pair, minutesOOR }) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function fmtPct(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }
